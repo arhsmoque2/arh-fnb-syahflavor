@@ -202,6 +202,7 @@
   </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 <script>
 (function(){
   "use strict";
@@ -582,6 +583,40 @@
     });
   }
 
+  // Community SheetJS can't write freeze panes via ws['!freeze'], so after
+  // XLSX builds the file we reopen the zip and patch the sheetView XML
+  // directly to pin the header + summary rows in place.
+  function exportWithFrozenHeader(wb, filename, freezeRows){
+    function fallback(){ XLSX.writeFile(wb, filename); }
+    try{
+      var out = XLSX.write(wb, {bookType:'xlsx', type:'array'});
+      JSZip.loadAsync(out).then(function(zip){
+        var sheetPath = Object.keys(zip.files).filter(function(p){
+          return /^xl\/worksheets\/sheet\d+\.xml$/.test(p);
+        })[0];
+        if(!sheetPath) throw new Error('worksheet xml not found');
+        return zip.file(sheetPath).async('string').then(function(xml){
+          var topLeft = 'A' + (freezeRows + 1);
+          var patched = xml.replace(/<sheetView([^>]*)\/>/, function(_, attrs){
+            return '<sheetView' + attrs + '>' +
+              '<pane ySplit="' + freezeRows + '" topLeftCell="' + topLeft + '" activePane="bottomLeft" state="frozen"/>' +
+              '<selection pane="bottomLeft" activeCell="' + topLeft + '" sqref="' + topLeft + '"/>' +
+              '</sheetView>';
+          });
+          if(patched === xml) throw new Error('sheetView tag not found');
+          zip.file(sheetPath, patched);
+          return zip.generateAsync({type:'blob', mimeType:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
+        });
+      }).then(function(blob){
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement('a');
+        a.href = url; a.download = filename;
+        document.body.appendChild(a); a.click(); document.body.removeChild(a);
+        setTimeout(function(){ URL.revokeObjectURL(url); }, 1000);
+      }).catch(function(err){ console.warn('Freeze pane export failed, falling back', err); fallback(); });
+    } catch(err){ console.warn('Freeze pane export failed, falling back', err); fallback(); }
+  }
+
   downloadBtn.addEventListener('click', function(){
     if(!state || !state.rows) return;
     var headers = state.headers, rows = state.rows, summableCols = state.summableCols;
@@ -590,9 +625,22 @@
     var termOk = r.term.status==='matched' || r.term.status==='recovered';
     var timeOk = r.time.status==='matched' || r.time.status==='recovered';
     var labelCol = termOk ? termCol : 0;
-    var aoa = [headers];
+
     var grand = {};
     summableCols.forEach(function(c){ grand[c]=0; });
+    rows.forEach(function(row){
+      summableCols.forEach(function(c){ grand[c] += Number(row.cells[c])||0; });
+    });
+
+    // Summary-first layout: header row, then the grand total, then the
+    // itemized/grouped detail. Freeze panes (applied below) pin both the
+    // header and this summary row so they stay visible while scrolling.
+    var aoa = [headers];
+    var grandRow = headers.map(function(){ return null; });
+    grandRow[labelCol] = termOk ? 'GRAND TOTAL' : 'GRAND TOTAL (QR ID column not found — rows not grouped)';
+    summableCols.forEach(function(c){ grandRow[c] = grand[c]; });
+    aoa.push(grandRow);
+    aoa.push(headers.map(function(){ return null; }));
 
     function writeRow(row){
       var out = row.cells.slice();
@@ -612,7 +660,7 @@
         summableCols.forEach(function(c){ sums[c]=0; });
         group.forEach(function(row){
           writeRow(row);
-          summableCols.forEach(function(c){ sums[c] += Number(row.cells[c])||0; grand[c] += Number(row.cells[c])||0; });
+          summableCols.forEach(function(c){ sums[c] += Number(row.cells[c])||0; });
         });
         var subtotalRow = headers.map(function(){ return null; });
         subtotalRow[termCol] = 'Subtotal — ' + term;
@@ -620,17 +668,8 @@
         aoa.push(subtotalRow);
       });
     } else {
-      rows.forEach(function(row){
-        writeRow(row);
-        summableCols.forEach(function(c){ grand[c] += Number(row.cells[c])||0; });
-      });
+      rows.forEach(function(row){ writeRow(row); });
     }
-
-    aoa.push(headers.map(function(){ return null; }));
-    var grandRow = headers.map(function(){ return null; });
-    grandRow[labelCol] = termOk ? 'GRAND TOTAL' : 'GRAND TOTAL (QR ID column not found — rows not grouped)';
-    summableCols.forEach(function(c){ grandRow[c] = grand[c]; });
-    aoa.push(grandRow);
 
     var ws = XLSX.utils.aoa_to_sheet(aoa);
     var wb = XLSX.utils.book_new();
@@ -638,7 +677,7 @@
 
     var srcName = state.sourceName || 'export.xlsx';
     var outName = 'processed-' + srcName.replace(/\.xls[x]?$/i, '') + '.xlsx';
-    XLSX.writeFile(wb, outName);
+    exportWithFrozenHeader(wb, outName, 2);
   });
 
   resetBtn.addEventListener('click', function(){
