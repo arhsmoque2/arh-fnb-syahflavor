@@ -1,0 +1,9 @@
+{
+  // Stateless static tool — no Worker logic, no storage, no API routes.
+  // Everything runs client-side in the browser; Cloudflare just serves the file.
+  "name": "arh-fnb-syahflavor",
+  "compatibility_date": "2026-09-17",
+  "assets": {
+    "directory": "."
+  }
+}

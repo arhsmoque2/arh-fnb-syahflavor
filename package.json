@@ -1,0 +1,14 @@
+{
+  "name": "arh-fnb-syahflavor",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Stateless QR-export summarizer for SyahFlavor — upload the bank export, get a per-QR-ID summary and a sorted, totalled spreadsheet back.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}
