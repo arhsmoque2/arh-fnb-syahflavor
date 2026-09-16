@@ -120,6 +120,34 @@
   .stateless-note{
     font-size:.76rem; color:var(--text-dim); text-align:center; line-height:1.5;
   }
+
+  .warn-title{ font-weight:700; font-size:.9rem; }
+  .warn-body{ font-size:.8rem; color:var(--text); }
+  .warn-card{
+    background:var(--turmeric-ink); border:1px solid var(--turmeric); color:var(--turmeric);
+    border-radius:13px; padding:12px 14px; display:flex; flex-direction:column; gap:8px; margin-top:10px;
+  }
+  .blocking-error{
+    background:var(--ember-ink); border:1px solid var(--ember); color:var(--ember);
+    border-radius:13px; padding:14px; display:flex; flex-direction:column; gap:6px; margin-top:10px;
+  }
+  .warn-actions{ display:flex; gap:8px; flex-wrap:wrap; }
+  .btn-small{
+    border:1.5px solid currentColor; background:transparent; color:inherit;
+    border-radius:9px; padding:8px 12px; font-weight:700; font-size:.8rem; cursor:pointer;
+  }
+  .warn-card .btn-small.primary{ background:var(--turmeric); color:var(--turmeric-ink); border-color:transparent; }
+  .blocking-error .btn-small.primary{ background:var(--ember); color:var(--ember-ink); border-color:transparent; }
+  .evidence-box{
+    background:var(--surface); border:1px solid var(--line); border-radius:10px;
+    padding:9px 11px; font-size:.78rem; color:var(--text-dim); margin-top:10px;
+  }
+  .evidence-box b{ color:var(--text); font-variant-numeric: tabular-nums; }
+  .recovered-note{
+    font-size:.78rem; color:var(--text-dim); background:var(--surface-2); border-radius:10px;
+    padding:9px 11px; margin-top:10px;
+  }
+  .undetermined{ color:var(--text-dim) !important; font-style:italic; }
 </style>
 </head>
 <body>
@@ -140,6 +168,7 @@
       </label>
       <input id="fileInput" type="file" accept=".xlsx,.xls">
       <div class="status-line" id="statusLine"></div>
+      <div id="issuesBlock"></div>
     </div>
 
     <div id="results">
@@ -195,8 +224,13 @@
   var termCount = document.getElementById('termCount');
   var downloadBtn = document.getElementById('downloadBtn');
   var resetBtn = document.getElementById('resetBtn');
+  var issuesBlock = document.getElementById('issuesBlock');
 
-  var state = null; // { headers, rows, termKey, amtKey, summableKeys, sourceName }
+  // state.roles[key] = { label, status, col }
+  //   status: 'matched' (found by header name) | 'pending' (not found yet, awaiting user)
+  //         | 'candidate' (heuristic found something, awaiting confirm) | 'recovered' (user confirmed)
+  //         | 'unresolved' (searched and nothing usable, or user declined)
+  var state = null;
 
   function showError(msg){
     statusLine.textContent = msg;
@@ -241,6 +275,118 @@
     reader.readAsArrayBuffer(file);
   });
 
+  function escapeHtml(s){
+    return String(s).replace(/[&<>"']/g, function(c){
+      return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+    });
+  }
+
+  function findCol(headers, needle){
+    var nn = norm(needle);
+    var exact = headers.findIndex(function(h){ return norm(h)===nn; });
+    if(exact>=0) return exact;
+    return headers.findIndex(function(h){ return norm(h).indexOf(nn)>=0; });
+  }
+
+  function isNumericColumn(headers, dataRows, c){
+    var allNumeric=true, sawAny=false;
+    for(var r=0;r<dataRows.length;r++){
+      var v = dataRows[r][c];
+      if(v===null || v==='') continue;
+      sawAny = true;
+      if(typeof v!=='number'){ allNumeric=false; break; }
+    }
+    return sawAny && allNumeric;
+  }
+
+  // ---------- content-shape recovery, used only after the user asks for it ----------
+
+  // Date & Time: score each column by the fraction of its values that parse as a real date.
+  function findDateCandidate(headers, dataRows, excludeCols){
+    var best=-1, bestScore=0;
+    for(var c=0;c<headers.length;c++){
+      if(excludeCols.indexOf(c)>=0) continue;
+      var ok=0, total=0;
+      for(var r=0;r<dataRows.length;r++){
+        var v = dataRows[r][c];
+        if(v===null || v==='') continue;
+        total++;
+        if(v instanceof Date && !isNaN(v)) ok++;
+        else if(typeof v==='number' && v>20000 && v<60000) ok++; // plausible Excel date serial
+        else if(typeof v==='string' && !isNaN(Date.parse(v))) ok++;
+      }
+      var score = total ? ok/total : 0;
+      if(score>bestScore){ bestScore=score; best=c; }
+    }
+    if(bestScore<0.9) return null;
+    var v0 = dataRows.map(function(r){ return r[best]; }).filter(function(v){ return v!=null && v!==''; })[0];
+    return { col:best, sample: (v0 instanceof Date) ? fmtDate(v0) : String(v0) };
+  }
+
+  // QR ID: alphanumeric, length >= 4, AND repeats (2..~10 distinct values, never 1, never ~one-per-row) —
+  // the repetition test is what separates a QR terminal id from a Transaction ID (unique per row)
+  // or a Merchant ID (same value every row); "alphanumeric + length" alone matches all of those too.
+  function findQrIdCandidate(headers, dataRows, excludeCols){
+    var n = dataRows.length, best=null, bestScore=-1;
+    for(var c=0;c<headers.length;c++){
+      if(excludeCols.indexOf(c)>=0) continue;
+      var shaped=0, total=0, seen={}, firstVal=null;
+      for(var r=0;r<n;r++){
+        var v = dataRows[r][c];
+        if(v===null || v==='') continue;
+        total++;
+        var sv = String(v).trim();
+        if(typeof v==='string' && /^[A-Za-z0-9]{4,}$/.test(sv)){ shaped++; seen[sv]=(seen[sv]||0)+1; if(!firstVal) firstVal=sv; }
+      }
+      if(total===0) continue;
+      var shapedFrac = shaped/total;
+      if(shapedFrac<0.9) continue;
+      var distinct = Object.keys(seen).length;
+      if(distinct<=1 || distinct>Math.max(10, n*0.05)) continue;
+      var score = shapedFrac - (distinct/n);
+      if(score>bestScore){ bestScore=score; best={ col:c, sample:firstVal, distinctCount:distinct, occurrences: seen[firstVal] }; }
+    }
+    return best;
+  }
+
+  // Amount: among fully-numeric columns, prefer one whose header hints at "amount/paid/total",
+  // otherwise the numeric column with the largest average magnitude (real settlement amounts
+  // dominate discount/GST/rate columns, which cluster near zero).
+  function findAmountCandidate(headers, dataRows, excludeCols){
+    var candidates = [];
+    for(var c=0;c<headers.length;c++){
+      if(excludeCols.indexOf(c)>=0) continue;
+      if(!isNumericColumn(headers, dataRows, c)) continue;
+      var sum=0, n=0;
+      for(var r=0;r<dataRows.length;r++){
+        var v = dataRows[r][c];
+        if(v===null || v==='') continue;
+        sum+=v; n++;
+      }
+      var h = norm(headers[c]);
+      var hinted = h.indexOf('amount')>=0 || h.indexOf('paid')>=0 || h.indexOf('total')>=0;
+      candidates.push({ col:c, avg: n?sum/n:0, hinted: hinted });
+    }
+    if(!candidates.length) return null;
+    // rank hinted columns first, by magnitude within each group — but ties are checked against
+    // the FULL candidate set below, not just the hinted subset, so a renamed column that lost its
+    // hint keyword can still be caught as an ambiguous match instead of silently going unflagged
+    var ranked = candidates.slice().sort(function(a,b){
+      if(a.hinted!==b.hinted) return a.hinted ? -1 : 1;
+      return b.avg - a.avg;
+    });
+    var top = ranked[0];
+    var ties = candidates.filter(function(cd){
+      return cd.col!==top.col && top.avg!==0 && Math.abs(cd.avg-top.avg)/Math.abs(top.avg) < 0.01;
+    }).map(function(cd){ return headers[cd.col]; });
+    return { col: top.col, sample: fmtRM(top.avg) + ' avg', ties: ties };
+  }
+
+  function excludedCols(){
+    var r = state.roles;
+    return [r.time.col, r.term.col, r.amt.col].filter(function(c){ return c>=0; });
+  }
+
   function processWorkbook(bytes, sourceName){
     var wb = XLSX.read(bytes, {type:'array', cellDates:true});
     var ws = wb.Sheets[wb.SheetNames[0]];
@@ -250,75 +396,168 @@
     var dataRows = aoa.slice(1).filter(function(r){ return r.some(function(c){ return c!==null && c!==''; }); });
     if(!dataRows.length){ showError('That file has a header row but no transactions.'); return; }
 
-    function findCol(needle){
-      var nn = norm(needle);
-      var exact = headers.findIndex(function(h){ return norm(h)===nn; });
-      if(exact>=0) return exact;
-      return headers.findIndex(function(h){ return norm(h).indexOf(nn)>=0; });
-    }
-    var timeCol = findCol('Date & Time');
-    var termCol = findCol('Cashier ID/Terminal ID');
-    if(termCol<0) termCol = findCol('Terminal ID');
-    if(timeCol<0){ showError("Couldn't find a Date & Time column — is this a QRPay export?"); return; }
-    if(termCol<0){ showError("Couldn't find a Terminal ID / QR ID column — is this a QRPay export?"); return; }
+    var timeCol = findCol(headers, 'Date & Time');
+    var termCol = findCol(headers, 'Cashier ID/Terminal ID');
+    if(termCol<0) termCol = findCol(headers, 'Terminal ID');
+    var amtCol = findCol(headers, 'Amount Paid to Merchant (RM)');
+    if(amtCol<0) amtCol = findCol(headers, 'Amount Paid to Merchant');
 
-    // detect summable columns: every non-null value across data rows is numeric, excluding the time/term columns
-    var summableCols = [];
-    for(var c=0;c<headers.length;c++){
-      if(c===timeCol || c===termCol) continue;
-      var allNumeric = true, sawAny = false;
-      for(var r=0;r<dataRows.length;r++){
-        var v = dataRows[r][c];
-        if(v===null || v==='') continue;
-        sawAny = true;
-        if(typeof v !== 'number'){ allNumeric = false; break; }
+    state = {
+      headers: headers, dataRows: dataRows, sourceName: sourceName,
+      roles: {
+        time: { label:'Date & Time', status: timeCol>=0 ? 'matched':'pending', col: timeCol },
+        term: { label:'QR ID (Terminal)', status: termCol>=0 ? 'matched':'pending', col: termCol },
+        amt:  { label:'Amount Paid to Merchant', status: amtCol>=0 ? 'matched':'pending', col: amtCol }
       }
-      if(sawAny && allNumeric) summableCols.push(c);
+    };
+    showStatus(dataRows.length + ' rows read.');
+    refresh();
+  }
+
+  function handleIssueAction(key, action){
+    var role = state.roles[key];
+    if(action==='skip'){ role.status='unresolved'; refresh(); return; }
+    if(action==='locate'){
+      var excl = excludedCols();
+      var candidate = null;
+      if(key==='time') candidate = findDateCandidate(state.headers, state.dataRows, excl);
+      else if(key==='term') candidate = findQrIdCandidate(state.headers, state.dataRows, excl);
+      else if(key==='amt') candidate = findAmountCandidate(state.headers, state.dataRows, excl);
+      if(candidate){ role.status='candidate'; role.candidate=candidate; }
+      else { role.status='unresolved'; }
+      refresh();
+      return;
     }
-    var amtCol = findCol('Amount Paid to Merchant (RM)');
-    if(amtCol<0) amtCol = findCol('Amount Paid to Merchant');
-    if(amtCol<0 || summableCols.indexOf(amtCol)<0){ amtCol = summableCols[0]; }
-    if(amtCol==null || amtCol<0){ showError("Couldn't find an amount column to total."); return; }
+    if(action==='confirm'){ role.status='recovered'; role.col=role.candidate.col; refresh(); return; }
+    if(action==='reject'){ role.status='unresolved'; refresh(); return; }
+  }
 
-    // normalize rows: keep original cell values, resolve time to a Date
-    var rows = dataRows.map(function(r){
-      var t = r[timeCol];
-      var d = (t instanceof Date) ? t : (typeof t==='number' ? new Date(Math.round((t-25569)*86400*1000)) : new Date(t));
-      return { cells: r, time: d, term: r[termCol]==null || r[termCol]==='' ? '(no QR ID recorded)' : String(r[termCol]) };
-    }).filter(function(r){ return !isNaN(r.time); });
+  function renderIssues(){
+    var r = state.roles, html = '';
+    ['time','term','amt'].forEach(function(key){
+      var role = r[key];
+      if(role.status==='pending'){
+        html += '<div class="warn-card">' +
+          '<span class="warn-title">Couldn’t find “'+escapeHtml(role.label)+'” by column name</span>' +
+          '<span class="warn-body">This export’s format may have changed. We can search the data itself for a column that looks right.</span>' +
+          '<div class="warn-actions">' +
+          '<button class="btn-small primary" data-role="'+key+'" data-action="locate" type="button">Try to locate it</button>' +
+          '<button class="btn-small" data-role="'+key+'" data-action="skip" type="button">Mark as cannot be determined</button>' +
+          '</div></div>';
+      } else if(role.status==='candidate'){
+        var c = role.candidate;
+        html += '<div class="warn-card">' +
+          '<span class="warn-title">Possible match for “'+escapeHtml(role.label)+'”</span>' +
+          '<div class="evidence-box">Column <b>'+escapeHtml(state.headers[c.col])+'</b><br>' +
+          'Example value: <b>'+escapeHtml(String(c.sample))+'</b>' +
+          (c.distinctCount ? (' · '+c.distinctCount+' distinct values across '+state.dataRows.length+' rows') : '') +
+          (c.ties && c.ties.length ? ('<br><b>Heads up:</b> '+escapeHtml(c.ties.join(', '))+' look(s) numerically identical in this file — could be a before-discount figure rather than the real paid amount. Check carefully before using.') : '') +
+          '</div>' +
+          '<div class="warn-actions">' +
+          '<button class="btn-small primary" data-role="'+key+'" data-action="confirm" type="button">Use this column</button>' +
+          '<button class="btn-small" data-role="'+key+'" data-action="reject" type="button">No, mark as undetermined</button>' +
+          '</div></div>';
+      } else if(role.status==='unresolved'){
+        var cls = (key==='amt') ? 'blocking-error' : 'warn-card';
+        html += '<div class="'+cls+'"><span class="warn-title">“'+escapeHtml(role.label)+'” — cannot be determined</span>' +
+          '<span class="warn-body">No column matched by name or by data shape.' +
+          (key==='amt' ? ' This file can’t be summarized until this is resolved — try a different export, or check if the amount column was renamed.' : ' Related totals below will show as undetermined.') +
+          '</span></div>';
+      } else if(role.status==='recovered'){
+        html += '<div class="recovered-note">“'+escapeHtml(role.label)+'” auto-recovered from column <b>'+escapeHtml(state.headers[role.col])+'</b> — double check this looks right before trusting the totals.</div>';
+      }
+    });
+    issuesBlock.innerHTML = html;
+    issuesBlock.querySelectorAll('button[data-action]').forEach(function(btn){
+      btn.addEventListener('click', function(){ handleIssueAction(btn.dataset.role, btn.dataset.action); });
+    });
+  }
 
-    if(!rows.length){ showError('Could not read any valid dates from that file.'); return; }
+  function finalizeRows(){
+    var r = state.roles;
+    var timeOk = r.time.status==='matched' || r.time.status==='recovered';
+    var termOk = r.term.status==='matched' || r.term.status==='recovered';
+    var timeCol = r.time.col, termCol = r.term.col;
 
-    rows.sort(function(a,b){
-      if(a.term!==b.term) return a.term<b.term ? -1 : 1;
-      return a.time - b.time;
+    state.rows = state.dataRows.map(function(row, idx){
+      var time = null;
+      if(timeOk){
+        var t = row[timeCol];
+        var d = (t instanceof Date) ? t : (typeof t==='number' ? new Date(Math.round((t-25569)*86400*1000)) : new Date(t));
+        if(!isNaN(d)) time = d;
+      }
+      var term = termOk ? (row[termCol]==null || row[termCol]==='' ? '(no QR ID recorded)' : String(row[termCol])) : null;
+      return { cells: row, time: time, term: term, idx: idx };
     });
 
-    state = { headers:headers, rows:rows, timeCol:timeCol, termCol:termCol, amtCol:amtCol, summableCols:summableCols, sourceName:sourceName };
+    state.rows.sort(function(a,b){
+      if(termOk && a.term!==b.term) return a.term<b.term ? -1 : 1;
+      if(timeOk && a.time && b.time) return a.time - b.time;
+      return a.idx - b.idx;
+    });
+
+    var summable = [];
+    for(var c=0;c<state.headers.length;c++){
+      if(c===timeCol || c===termCol) continue;
+      if(isNumericColumn(state.headers, state.dataRows, c)) summable.push(c);
+    }
+    state.summableCols = summable;
+  }
+
+  function refresh(){
+    renderIssues();
+    var r = state.roles;
+    if(r.amt.status==='pending' || r.amt.status==='candidate' || r.amt.status==='unresolved'){
+      // amount is a hard requirement — no partial totals without it
+      results.classList.remove('show');
+      if(r.amt.status==='unresolved') showStatus('Cannot summarize this file.');
+      return;
+    }
+    finalizeRows();
     renderSummary();
-    showStatus(rows.length + ' transactions loaded, sorted by QR ID.');
+    showStatus(state.rows.length + ' transactions loaded.');
     results.classList.add('show');
   }
 
   function renderSummary(){
-    var rows = state.rows, headers = state.headers, amtCol = state.amtCol, summableCols = state.summableCols;
+    var r = state.roles;
+    var rows = state.rows, headers = state.headers, amtCol = r.amt.col, summableCols = state.summableCols;
+    var timeOk = r.time.status==='matched' || r.time.status==='recovered';
+    var termOk = r.term.status==='matched' || r.term.status==='recovered';
 
-    var minT = rows[0].time, maxT = rows[0].time;
-    rows.forEach(function(r){ if(r.time<minT) minT=r.time; if(r.time>maxT) maxT=r.time; });
-    rangeNote.textContent = (fmtDate(minT)===fmtDate(maxT)) ? fmtDate(minT) : (fmtDate(minT) + ' – ' + fmtDate(maxT));
+    if(timeOk){
+      var known = rows.filter(function(row){ return row.time; });
+      if(known.length){
+        var minT=known[0].time, maxT=known[0].time;
+        known.forEach(function(row){ if(row.time<minT) minT=row.time; if(row.time>maxT) maxT=row.time; });
+        rangeNote.textContent = (fmtDate(minT)===fmtDate(maxT)) ? fmtDate(minT) : (fmtDate(minT) + ' – ' + fmtDate(maxT));
+        rangeNote.classList.remove('undetermined');
+      } else {
+        rangeNote.textContent = 'Date range: cannot be determined';
+        rangeNote.classList.add('undetermined');
+      }
+    } else {
+      rangeNote.textContent = 'Date range: cannot be determined';
+      rangeNote.classList.add('undetermined');
+    }
 
     var grandTotal = 0;
-    rows.forEach(function(r){ grandTotal += Number(r.cells[amtCol])||0; });
+    rows.forEach(function(row){ grandTotal += Number(row.cells[amtCol])||0; });
     grandNum.textContent = fmtRM(grandTotal);
     copyGrand.onclick = function(){ copyToClipboard(grandTotal.toFixed(2), copyGrand); };
 
-    var byTerm = {};
-    var order = [];
-    rows.forEach(function(r){
-      if(!byTerm[r.term]){ byTerm[r.term] = {count:0, sums:{}}; order.push(r.term); }
-      byTerm[r.term].count++;
+    if(!termOk){
+      termCount.textContent = 'cannot be determined';
+      termList.innerHTML = '<li class="empty-note undetermined">QR ID column cannot be determined — per-terminal breakdown unavailable. The grand total above is still accurate.</li>';
+      return;
+    }
+
+    var byTerm = {}, order = [];
+    rows.forEach(function(row){
+      if(!byTerm[row.term]){ byTerm[row.term] = {count:0, sums:{}}; order.push(row.term); }
+      byTerm[row.term].count++;
       summableCols.forEach(function(c){
-        byTerm[r.term].sums[c] = (byTerm[r.term].sums[c]||0) + (Number(r.cells[c])||0);
+        byTerm[row.term].sums[c] = (byTerm[row.term].sums[c]||0) + (Number(row.cells[c])||0);
       });
     });
 
@@ -335,7 +574,7 @@
       li.innerHTML =
         '<div class="term-head"><span class="term-name">'+escapeHtml(term)+'</span>' +
         '<span class="term-count">'+t.count+' txn'+(t.count===1?'':'s')+'</span></div>' +
-        '<button class="copy-sub" type="button" data-term="'+escapeHtml(term)+'"><span class="num">'+fmtRM(t.sums[amtCol])+'</span><span class="hint">Tap to copy</span></button>' +
+        '<button class="copy-sub" type="button"><span class="num">'+fmtRM(t.sums[amtCol])+'</span><span class="hint">Tap to copy</span></button>' +
         (extraHtml ? '<div class="term-extra">'+extraHtml+'</div>' : '');
       var btn = li.querySelector('.copy-sub');
       btn.addEventListener('click', function(){ copyToClipboard(t.sums[amtCol].toFixed(2), btn); });
@@ -343,45 +582,53 @@
     });
   }
 
-  function escapeHtml(s){
-    return String(s).replace(/[&<>"']/g, function(c){
-      return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
-    });
-  }
-
   downloadBtn.addEventListener('click', function(){
-    if(!state) return;
-    var headers = state.headers, rows = state.rows, amtCol = state.amtCol, summableCols = state.summableCols, termCol = state.termCol, timeCol = state.timeCol;
+    if(!state || !state.rows) return;
+    var headers = state.headers, rows = state.rows, summableCols = state.summableCols;
+    var r = state.roles;
+    var amtCol = r.amt.col, termCol = r.term.col, timeCol = r.time.col;
+    var termOk = r.term.status==='matched' || r.term.status==='recovered';
+    var timeOk = r.time.status==='matched' || r.time.status==='recovered';
+    var labelCol = termOk ? termCol : 0;
     var aoa = [headers];
-
-    var byTerm = {}, order = [];
-    rows.forEach(function(r){
-      if(!byTerm[r.term]){ byTerm[r.term]=[]; order.push(r.term); }
-      byTerm[r.term].push(r);
-    });
-
     var grand = {};
     summableCols.forEach(function(c){ grand[c]=0; });
 
-    order.forEach(function(term){
-      var group = byTerm[term];
-      var sums = {};
-      summableCols.forEach(function(c){ sums[c]=0; });
-      group.forEach(function(r){
-        var rowOut = r.cells.slice();
-        rowOut[timeCol] = r.time;
-        aoa.push(rowOut);
-        summableCols.forEach(function(c){ sums[c] += Number(r.cells[c])||0; grand[c] += Number(r.cells[c])||0; });
+    function writeRow(row){
+      var out = row.cells.slice();
+      if(timeOk && row.time) out[timeCol] = row.time;
+      aoa.push(out);
+    }
+
+    if(termOk){
+      var byTerm = {}, order = [];
+      rows.forEach(function(row){
+        if(!byTerm[row.term]){ byTerm[row.term]=[]; order.push(row.term); }
+        byTerm[row.term].push(row);
       });
-      var subtotalRow = headers.map(function(){ return null; });
-      subtotalRow[termCol] = 'Subtotal — ' + term;
-      summableCols.forEach(function(c){ subtotalRow[c] = sums[c]; });
-      aoa.push(subtotalRow);
-    });
+      order.forEach(function(term){
+        var group = byTerm[term];
+        var sums = {};
+        summableCols.forEach(function(c){ sums[c]=0; });
+        group.forEach(function(row){
+          writeRow(row);
+          summableCols.forEach(function(c){ sums[c] += Number(row.cells[c])||0; grand[c] += Number(row.cells[c])||0; });
+        });
+        var subtotalRow = headers.map(function(){ return null; });
+        subtotalRow[termCol] = 'Subtotal — ' + term;
+        summableCols.forEach(function(c){ subtotalRow[c] = sums[c]; });
+        aoa.push(subtotalRow);
+      });
+    } else {
+      rows.forEach(function(row){
+        writeRow(row);
+        summableCols.forEach(function(c){ grand[c] += Number(row.cells[c])||0; });
+      });
+    }
 
     aoa.push(headers.map(function(){ return null; }));
     var grandRow = headers.map(function(){ return null; });
-    grandRow[termCol] = 'GRAND TOTAL';
+    grandRow[labelCol] = termOk ? 'GRAND TOTAL' : 'GRAND TOTAL (QR ID column not found — rows not grouped)';
     summableCols.forEach(function(c){ grandRow[c] = grand[c]; });
     aoa.push(grandRow);
 
@@ -400,6 +647,8 @@
     dropzoneLabel.textContent = 'Upload Maybank QRPay export (.xlsx)';
     statusLine.textContent = '';
     statusLine.classList.remove('error');
+    issuesBlock.innerHTML = '';
+    rangeNote.classList.remove('undetermined');
     results.classList.remove('show');
   });
 })();
